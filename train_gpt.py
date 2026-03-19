@@ -302,12 +302,8 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 # -----------------------------
-# POST-TRAINING QUANTIZATION
+# QUANTIZATION CONSTANTS
 # -----------------------------
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -317,134 +313,6 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
-        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
-    ).split(",")
-    if pattern
-)
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
-INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-
-def tensor_nbytes(t: Tensor) -> int:
-    return int(t.numel()) * int(t.element_size())
-
-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-        return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
-        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
-    return t
-
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
-
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
-        0,
-    )
-
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel())
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
-
-        if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = t
-            stats["int8_payload_bytes"] += tensor_nbytes(t)
-            continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += tensor_nbytes(kept)
-            continue
-
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-
-    obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-    }
-    if qmeta:
-        obj["qmeta"] = qmeta
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
-
-def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
-    out: dict[str, Tensor] = {}
-    qmeta = obj.get("qmeta", {})
-    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, q in obj["quantized"].items():
-        dtype = getattr(torch, obj["dtypes"][name])
-        s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
-            s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
-        else:
-            scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
-    for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
-        out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
-        out[name] = out_t
-    return out
-
 
 # -----------------------------
 # TERNARY COMPRESSION PIPELINE
@@ -966,6 +834,133 @@ def activate_qat(model: nn.Module) -> None:
 
 
 # -----------------------------
+# TEST-TIME TRAINING
+# -----------------------------
+
+class TTTModule:
+    """
+    Per-document test-time training for evaluation.
+    Adapts the last N layers using a single SGD step on the document prefix,
+    then evaluates on the suffix with adapted weights.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        num_adapt_layers: int = 2,
+        prefix_frac: float = 0.3,
+        ttt_lr: float = 1e-4,
+    ):
+        self.model = model
+        self.num_adapt_layers = num_adapt_layers
+        self.prefix_frac = prefix_frac
+        self.ttt_lr = ttt_lr
+        self._checkpoint: dict[str, Tensor] | None = None
+
+    def _get_adapt_params(self) -> list[nn.Parameter]:
+        """Collect parameters from coda + last shared block(s) of the recurrent group."""
+        params: list[nn.Parameter] = []
+        # Always include coda block
+        params.extend(self.model.coda.parameters())
+        # If num_adapt_layers > 1, include last shared block(s) from recurrent group
+        if self.num_adapt_layers > 1:
+            extra = self.num_adapt_layers - 1
+            blocks = list(self.model.recurrent.blocks)
+            for block in blocks[-extra:]:
+                params.extend(block.parameters())
+        return params
+
+    def checkpoint(self) -> None:
+        """Save current weights of adaptable parameters for later reset."""
+        self._checkpoint = {
+            name: p.detach().clone()
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+
+    def reset(self) -> None:
+        """Restore all model weights to pre-adaptation checkpoint."""
+        if self._checkpoint is None:
+            return
+        with torch.no_grad():
+            for name, p in self.model.named_parameters():
+                if name in self._checkpoint:
+                    p.copy_(self._checkpoint[name])
+
+    def adapt_and_eval(
+        self, tokens: Tensor, seq_len: int
+    ) -> tuple[float, int] | None:
+        """
+        Adapt on prefix, evaluate on suffix.
+
+        Args:
+            tokens: 1-D token tensor for a single document (on device).
+            seq_len: sequence length for reshaping into batches.
+
+        Returns:
+            (suffix_loss_sum, suffix_token_count) or None if document is too short.
+        """
+        num_tokens = tokens.numel()
+        # Compute prefix length: floor(L * prefix_frac / seq_len) * seq_len
+        prefix_len = int(num_tokens * self.prefix_frac)
+        prefix_len = (prefix_len // seq_len) * seq_len
+        if prefix_len < seq_len:
+            # Document too short for TTT
+            return None
+
+        suffix_start = prefix_len
+        suffix_tokens = num_tokens - suffix_start
+        if suffix_tokens <= seq_len:
+            # Not enough suffix tokens to evaluate
+            return None
+
+        # --- Step 1: Forward on prefix, compute loss ---
+        self.model.train()
+        adapt_params = self._get_adapt_params()
+
+        # prefix includes one extra token for targets
+        prefix = tokens[:prefix_len + 1]
+        px = prefix[:-1].reshape(-1, seq_len)
+        py = prefix[1:].reshape(-1, seq_len)
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            prefix_loss = self.model(px, py)
+
+        # --- Step 2: Single SGD step on adapt params only ---
+        grads = torch.autograd.grad(prefix_loss, adapt_params, allow_unused=True)
+        nan_detected = False
+        with torch.no_grad():
+            for param, grad in zip(adapt_params, grads):
+                if grad is not None:
+                    if not torch.isfinite(grad).all():
+                        nan_detected = True
+                        break
+                    param.add_(grad, alpha=-self.ttt_lr)
+
+        if nan_detected:
+            # NaN gradient — skip adaptation, reset and return None
+            self.reset()
+            return None
+
+        # --- Step 3: Evaluate on suffix ---
+        self.model.eval()
+        # Align suffix to seq_len boundary
+        usable_suffix = ((suffix_tokens - 1) // seq_len) * seq_len
+        if usable_suffix < seq_len:
+            return None
+
+        suffix = tokens[suffix_start : suffix_start + usable_suffix + 1]
+        sx = suffix[:-1].reshape(-1, seq_len)
+        sy = suffix[1:].reshape(-1, seq_len)
+
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            suffix_loss = self.model(sx, sy)
+
+        suffix_token_count = sy.numel()
+        return float(suffix_loss.item()), suffix_token_count
+
+
+# -----------------------------
 # TRAINING
 # -----------------------------
 
@@ -1425,6 +1420,51 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_ternary_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # -----------------------------
+    # TEST-TIME TRAINING EVALUATION
+    # -----------------------------
+    if args.ttt_enabled and master_process:
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        log0("ttt_eval: starting test-time training evaluation")
+
+        ttt = TTTModule(
+            model=base_model, num_adapt_layers=args.ttt_adapt_layers,
+            prefix_frac=args.ttt_prefix_frac, ttt_lr=args.ttt_lr,
+        )
+
+        ttt_total_loss, ttt_total_tokens = 0.0, 0
+        ttt_docs_adapted, ttt_docs_skipped = 0, 0
+        doc_chunk_size = args.train_seq_len * 32
+        flat_val = val_tokens.to(device)
+
+        for chunk_idx in range((flat_val.numel() - 1) // doc_chunk_size):
+            start = chunk_idx * doc_chunk_size
+            chunk_tokens = flat_val[start : min(start + doc_chunk_size + 1, flat_val.numel())]
+            if chunk_tokens.numel() <= args.train_seq_len + 1:
+                ttt_docs_skipped += 1
+                continue
+            ttt.checkpoint()
+            result = ttt.adapt_and_eval(chunk_tokens, args.train_seq_len)
+            ttt.reset()
+            if result is None:
+                ttt_docs_skipped += 1
+                continue
+            loss_val, token_count = result
+            ttt_total_loss += loss_val * token_count
+            ttt_total_tokens += token_count
+            ttt_docs_adapted += 1
+
+        if ttt_total_tokens > 0:
+            ttt_avg_loss = ttt_total_loss / ttt_total_tokens
+            ttt_bpb = ttt_avg_loss / math.log(2.0)
+            log0(f"ttt_eval: adapted={ttt_docs_adapted} skipped={ttt_docs_skipped} "
+                 f"ttt_val_loss:{ttt_avg_loss:.4f} ttt_approx_bpb:{ttt_bpb:.4f}")
+        else:
+            log0(f"ttt_eval: no documents adapted (skipped={ttt_docs_skipped})")
+        torch.cuda.synchronize()
+        log0(f"ttt_eval: completed in {1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
 
     if distributed:
         dist.destroy_process_group()

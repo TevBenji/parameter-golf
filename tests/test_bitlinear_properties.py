@@ -17,7 +17,7 @@ from bitlinear import BitLinear, compute_l1_reg
     cols=st.integers(min_value=1, max_value=128),
     seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
-@settings(max_examples=100)
+@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
 def test_ternary_quantization_roundtrip(rows, cols, seed):
     """
     Property 1: Ternary quantization round-trip.
@@ -54,7 +54,7 @@ def test_ternary_quantization_roundtrip(rows, cols, seed):
     seq_len=st.integers(min_value=1, max_value=16),
     seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
-@settings(max_examples=100)
+@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
 def test_ste_gradient_flow(in_features, out_features, batch_size, seq_len, seed):
     """
     Property 2: STE gradient flow.
@@ -85,7 +85,7 @@ def test_ste_gradient_flow(in_features, out_features, batch_size, seq_len, seed)
     scale_factor=st.floats(min_value=0.1, max_value=10.0, allow_nan=False, allow_infinity=False),
     seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
-@settings(max_examples=100)
+@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
 def test_l1_regularization_proportionality(in_features, out_features, scale_factor, seed):
     """Property 3: L1 regularization proportionality. Validates: Requirements 1.3"""
     torch.manual_seed(seed)
@@ -167,7 +167,7 @@ def test_bitlinear_drop_in_shape_compatibility(in_features, out_features, batch_
     seq_len=st.integers(min_value=1, max_value=16),
     seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
-@settings(max_examples=100)
+@settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
 def test_latent_weight_preservation_during_qat(in_features, out_features, batch_size, seq_len, seed):
     """Property 7: Latent weight preservation during QAT. Validates: Requirements 2.3"""
     torch.manual_seed(seed)
