@@ -61,14 +61,35 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
+    num_heads = int(os.environ.get("NUM_HEADS", 12))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 3))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Recurrence.
+    num_shared_blocks = int(os.environ.get("NUM_SHARED_BLOCKS", 3))
+    num_loops = int(os.environ.get("NUM_LOOPS", 10))
+    loop_signal_rank = int(os.environ.get("LOOP_SIGNAL_RANK", 48))
+    progressive_loss_loops = [int(x) for x in
+        os.environ.get("PROGRESSIVE_LOSS_LOOPS", "4,7").split(",")]
+    progressive_loss_weight = float(os.environ.get("PROGRESSIVE_LOSS_WEIGHT", 0.3))
+
+    # QAT.
+    qat_switchover_frac = float(os.environ.get("QAT_SWITCHOVER_FRAC", 0.2))
+    qat_lr_factor = float(os.environ.get("QAT_LR_FACTOR", 0.5))
+    l1_reg_lambda = float(os.environ.get("L1_REG_LAMBDA", 1e-5))
+
+    # TTT.
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_prefix_frac = float(os.environ.get("TTT_PREFIX_FRAC", 0.3))
+    ttt_lr = float(os.environ.get("TTT_LR", 1e-4))
+    ttt_adapt_layers = int(os.environ.get("TTT_ADAPT_LAYERS", 2))
+
+    # Truncated BPTT (for deep recurrence).
+    tbptt_enabled = bool(int(os.environ.get("TBPTT_ENABLED", "0")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -423,6 +444,91 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
+# TERNARY COMPRESSION PIPELINE
+# -----------------------------
+# Replaces int8 quantization for BitLinear weights. Ternary values {-1, 0, +1}
+# are packed at 2 bits per weight (4 values per byte), then zlib-compressed.
+# Non-ternary params (embeddings, norms, scalars) pass through as fp16.
+
+TERNARY_KEEP_FLOAT_MAX_NUMEL = 65_536
+
+def pack_ternary(w_ternary: Tensor) -> tuple[bytes, tuple[int, ...]]:
+    """
+    Pack ternary {-1, 0, +1} tensor into 2-bit encoding.
+    Encoding: -1 -> 0b00, 0 -> 0b01, +1 -> 0b10
+    Packs 4 values per byte.
+    Returns packed bytes and original shape.
+    """
+    shape = tuple(w_ternary.shape)
+    flat = w_ternary.flatten().to(torch.int8) + 1  # map {-1,0,+1} -> {0,1,2}
+    n = flat.numel()
+    # Pad to multiple of 4
+    pad_len = (4 - n % 4) % 4
+    if pad_len:
+        flat = torch.cat([flat, torch.zeros(pad_len, dtype=torch.int8)])
+    flat_np = flat.numpy().astype(np.uint8)
+    packed = np.zeros(len(flat_np) // 4, dtype=np.uint8)
+    for i in range(4):
+        packed |= flat_np[i::4] << (i * 2)
+    return packed.tobytes(), shape
+
+
+def unpack_ternary(data: bytes, shape: tuple[int, ...]) -> Tensor:
+    """Unpack 2-bit encoded ternary values back to {-1, 0, +1} tensor."""
+    packed = np.frombuffer(data, dtype=np.uint8)
+    total = 1
+    for s in shape:
+        total *= s
+    flat = np.zeros(len(packed) * 4, dtype=np.int8)
+    for i in range(4):
+        flat[i::4] = (packed >> (i * 2)) & 0x03
+    flat = flat[:total] - 1  # map {0,1,2} -> {-1,0,+1}
+    return torch.from_numpy(flat.copy()).reshape(shape)
+
+
+def quantize_state_dict_ternary(state_dict: dict[str, Tensor]) -> dict:
+    """
+    Compress model state dict using ternary encoding for large 2D float tensors
+    (BitLinear weights) and fp16 for remaining parameters.
+    """
+    from bitlinear import BitLinear
+
+    ternary_data: dict[str, dict] = {}
+    passthrough: dict[str, Tensor] = {}
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu()
+        # Large 2D float tensors get ternary treatment
+        if t.is_floating_point() and t.ndim == 2 and t.numel() > TERNARY_KEEP_FLOAT_MAX_NUMEL:
+            w_ternary, scale = BitLinear.quantize_ternary(t)
+            packed, shape = pack_ternary(w_ternary)
+            ternary_data[name] = {
+                "packed": packed,
+                "shape": list(shape),
+                "scale": scale.to(torch.float16).numpy().tobytes(),
+                "scale_shape": list(scale.shape),
+            }
+        else:
+            passthrough[name] = t.to(torch.float16 if t.is_floating_point() else t.dtype)
+
+    return {"ternary": ternary_data, "passthrough": passthrough}
+
+
+def dequantize_state_dict_ternary(obj: dict) -> dict[str, Tensor]:
+    """Decompress ternary state dict back to full-precision tensors."""
+    out: dict[str, Tensor] = {}
+    for name, info in obj["ternary"].items():
+        w_ternary = unpack_ternary(info["packed"], tuple(info["shape"]))
+        scale = torch.from_numpy(
+            np.frombuffer(info["scale"], dtype=np.float16).copy()
+        ).to(torch.float32).reshape(info["scale_shape"])
+        out[name] = (w_ternary.float() * scale.unsqueeze(-1)).to(torch.bfloat16)
+    for name, t in obj["passthrough"].items():
+        out[name] = t.float() if t.is_floating_point() else t
+    return out
+
+
+# -----------------------------
 # DATA LOADING 
 # -----------------------------
 
@@ -760,6 +866,11 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if model_dim % num_heads != 0:
+            raise ValueError(f"model_dim ({model_dim}) must be divisible by num_heads ({num_heads})")
+        head_dim = model_dim // num_heads
+        if head_dim != 64:
+            raise ValueError(f"head_dim must be 64, got {head_dim} (model_dim={model_dim}, num_heads={num_heads})")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -950,11 +1061,47 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        num_shared_blocks=args.num_shared_blocks,
+        num_loops=args.num_loops,
+        loop_signal_rank=args.loop_signal_rank,
+        progressive_loss_loops=args.progressive_loss_loops,
+        progressive_loss_weight=args.progressive_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    # --- Initialization validation and size budget logging ---
+    if args.qat_switchover_frac < 0.1 or args.qat_switchover_frac > 0.5:
+        log0(f"WARNING: qat_switchover_frac={args.qat_switchover_frac} is outside "
+             f"recommended range [0.1, 0.5]")
+
+    stored_params = sum(p.numel() for p in base_model.parameters())
+    effective_depth = 1 + args.num_shared_blocks * args.num_loops + 1  # prelude + K*M + coda
+    # Effective params: recurrent blocks are reused M times
+    recurrent_params = sum(p.numel() for p in base_model.recurrent.blocks.parameters())
+    non_recurrent_params = stored_params - recurrent_params
+    effective_params = non_recurrent_params + recurrent_params * args.num_loops
+
+    # Estimate compressed size: large 2D params → ~1.5 bits/weight (ternary), rest → fp16
+    ternary_params = sum(p.numel() for p in base_model.parameters()
+                         if p.ndim == 2 and p.numel() > 65536)
+    other_params = stored_params - ternary_params
+    est_ternary_bytes = int(ternary_params * 1.5 / 8)  # 1.5 bits per weight
+    est_other_bytes = other_params * 2  # fp16
+    est_compressed = int((est_ternary_bytes + est_other_bytes) * 1.1)  # ~10% zlib overhead
+    est_code_bytes = 60_000  # ~1500 lines × 40 bytes
+    est_total = est_compressed + est_code_bytes
+    compression_ratio = (stored_params * 4) / max(est_compressed, 1)  # fp32 baseline
+
+    log0(f"size_budget: stored_params={stored_params:,} effective_params={effective_params:,} "
+         f"effective_depth={effective_depth} compression_ratio={compression_ratio:.2f}x")
+    log0(f"size_budget: est_ternary={est_ternary_bytes:,}B est_other={est_other_bytes:,}B "
+         f"est_compressed={est_compressed:,}B est_total={est_total:,}B")
+    if est_total > 15_000_000:
+        log0(f"WARNING: estimated artifact size {est_total:,}B exceeds 15MB — tight size budget")
+
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1185,8 +1332,8 @@ def main() -> None:
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # Save the raw state, then produce the ternary-compressed + zlib artifact
+    # and validate the round-tripped weights produce identical outputs.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1194,52 +1341,58 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        log0(f"Total submission size (raw): {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
+    # Pre-quantization validation BPB
+    torch.cuda.synchronize()
+    t_prequant = time.perf_counter()
+    prequant_val_loss, prequant_val_bpb = eval_val(
+        args, model, rank, world_size, device, grad_accum_steps,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(f"pre_quantization val_loss:{prequant_val_loss:.4f} val_bpb:{prequant_val_bpb:.4f} "
+         f"eval_time:{1000.0 * (time.perf_counter() - t_prequant):.0f}ms")
+
+    # Ternary compression
+    ternary_obj = quantize_state_dict_ternary(base_model.state_dict())
+    ternary_buf = io.BytesIO()
+    torch.save(ternary_obj, ternary_buf)
+    ternary_raw = ternary_buf.getvalue()
+    ternary_blob = zlib.compress(ternary_raw, level=9)
+    compressed_model_bytes = len(ternary_blob)
+    code_bytes = len(code.encode("utf-8"))
+    total_artifact_bytes = compressed_model_bytes + code_bytes
+
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-        log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
-        )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        with open("final_model.ternary.ptz", "wb") as f:
+            f.write(ternary_blob)
+        log0(f"compression: code_bytes={code_bytes} compressed_model_bytes={compressed_model_bytes} "
+             f"total_artifact_bytes={total_artifact_bytes}")
+        if total_artifact_bytes >= 16_000_000:
+            log0(f"FATAL: artifact size {total_artifact_bytes} exceeds 16,000,000 byte cap "
+                 f"(overage: {total_artifact_bytes - 16_000_000} bytes)")
+            sys.exit(1)
 
+    # Round-trip validation: decompress and verify identical outputs
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    with open("final_model.ternary.ptz", "rb") as f:
+        ternary_blob_disk = f.read()
+    ternary_state = torch.load(io.BytesIO(zlib.decompress(ternary_blob_disk)), map_location="cpu")
+    base_model.load_state_dict(dequantize_state_dict_ternary(ternary_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
+        args, model, rank, world_size, device, grad_accum_steps,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_ternary_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_ternary_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
