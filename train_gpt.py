@@ -27,6 +27,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from bitlinear import BitLinear, compute_l1_reg
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -54,6 +56,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -952,6 +955,17 @@ class GPT(nn.Module):
 
 
 # -----------------------------
+# QAT HELPERS
+# -----------------------------
+
+def activate_qat(model: nn.Module) -> None:
+    """Enable ternary quantization in all BitLinear layers."""
+    for m in model.modules():
+        if isinstance(m, BitLinear):
+            m.qat_enabled = True
+
+
+# -----------------------------
 # TRAINING
 # -----------------------------
 
@@ -1192,6 +1206,9 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        # Warmup: linear ramp from 0 to 1 over lr_warmup_steps
+        if args.lr_warmup_steps > 0 and step < args.lr_warmup_steps:
+            return (step + 1) / args.lr_warmup_steps
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
@@ -1234,6 +1251,8 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    qat_switchover_step = int(args.qat_switchover_frac * args.iterations)
+    qat_active = False
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1287,6 +1306,19 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+
+        # QAT switchover: activate ternary constraints and reduce Muon LR
+        if not qat_active and step >= qat_switchover_step:
+            activate_qat(base_model)
+            for group in optimizer_muon.param_groups:
+                group["base_lr"] *= args.qat_lr_factor
+            qat_active = True
+            log0(f"QAT activated at step {step}, Muon LR reduced by {args.qat_lr_factor}x")
+
+        # L1 regularization on BitLinear weights when QAT is active
+        if qat_active:
+            l1_loss = compute_l1_reg(base_model, args.l1_reg_lambda)
+            l1_loss.backward()
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
