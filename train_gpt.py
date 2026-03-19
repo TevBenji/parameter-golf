@@ -1,14 +1,11 @@
-"""
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
-
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
-"""
+# train_gpt.py — Single-file training script for Parameter Golf. Must stay under 1500 lines.
 
 from __future__ import annotations
 
 import copy
 import glob
 import io
+import json
 import math
 import os
 import random
@@ -27,16 +24,50 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from bitlinear import BitLinear, compute_l1_reg
+# --- BITLINEAR: TERNARY QUANTIZATION-AWARE LINEAR LAYER ---
 
-# -----------------------------
-# HYPERPARAMETERS
-# -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+class BitLinear(nn.Linear):
+    """
+    Ternary quantization-aware linear layer.
+    Maintains latent fp32 weights; forward pass uses ternary {-1, 0, +1}
+    when qat_enabled=True, with straight-through estimator for gradients.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__(in_features, out_features, bias=bias)
+        self.register_buffer("weight_scale", torch.ones(out_features))
+        self.qat_enabled: bool = False
+        self.l1_lambda: float = 1e-5
+
+    @staticmethod
+    def quantize_ternary(w: Tensor) -> tuple[Tensor, Tensor]:
+        """AbsMedian quantization: scale = mean(|w|) per row, then round to {-1,0,+1}."""
+        scale = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-8)
+        w_scaled = w / scale
+        w_ternary = torch.clamp(torch.round(w_scaled), -1, 1)
+        return w_ternary, scale.squeeze(-1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.qat_enabled:
+            w_ternary, scale = self.quantize_ternary(self.weight)
+            w_q = self.weight + (w_ternary * scale.unsqueeze(-1) - self.weight).detach()
+            return F.linear(x, w_q.to(x.dtype), self.bias)
+        else:
+            return F.linear(x, self.weight.to(x.dtype), self.bias)
+
+
+def compute_l1_reg(model: nn.Module, l1_lambda: float) -> Tensor:
+    """L1 regularization on BitLinear latent weights to encourage ternary zeros."""
+    reg = torch.tensor(0.0, device=next(model.parameters()).device)
+    for m in model.modules():
+        if isinstance(m, BitLinear) and m.qat_enabled:
+            reg = reg + m.weight.abs().mean()
+    return l1_lambda * reg
+
+
+# --- HYPERPARAMETERS ---
+# Default Simple Baseline run: 9 blocks at width 512, 8 heads with 4 KV heads (GQA),
+# 2x MLP expansion, vocab 1024, seq_len 1024, tied embeddings, 524K tokens/step × 20K iters
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -110,16 +141,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-# -----------------------------
-# MUON OPTIMIZER 
-# -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
+# --- MUON OPTIMIZER ---
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
+    """Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration."""
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -192,14 +217,7 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-# -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
-# -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
+# --- TOKENIZER-AGNOSTIC EVALUATION ---
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -252,9 +270,7 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    # Validation: compute val_loss (token cross-entropy) and val_bpb (compression metric).
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -301,9 +317,7 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
-# -----------------------------
-# QUANTIZATION CONSTANTS
-# -----------------------------
+# --- QUANTIZATION CONSTANTS ---
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -314,11 +328,8 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     if pattern
 )
 
-# -----------------------------
-# TERNARY COMPRESSION PIPELINE
-# -----------------------------
-# Replaces int8 quantization for BitLinear weights. Ternary values {-1, 0, +1}
-# are packed at 2 bits per weight (4 values per byte), then zlib-compressed.
+# --- TERNARY COMPRESSION PIPELINE ---
+# Ternary {-1, 0, +1} packed at 2 bits/weight (4 per byte), then zlib-compressed.
 # Non-ternary params (embeddings, norms, scalars) pass through as fp16.
 
 TERNARY_KEEP_FLOAT_MAX_NUMEL = 65_536
@@ -362,8 +373,6 @@ def quantize_state_dict_ternary(state_dict: dict[str, Tensor]) -> dict:
     Compress model state dict using ternary encoding for large 2D float tensors
     (BitLinear weights) and fp16 for remaining parameters.
     """
-    from bitlinear import BitLinear
-
     ternary_data: dict[str, dict] = {}
     passthrough: dict[str, Tensor] = {}
 
@@ -399,9 +408,7 @@ def dequantize_state_dict_ternary(obj: dict) -> dict[str, Tensor]:
     return out
 
 
-# -----------------------------
-# DATA LOADING 
-# -----------------------------
+# --- DATA LOADING ---
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
@@ -421,8 +428,7 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
+    """Reads shards sequentially and wraps around forever."""
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
@@ -452,8 +458,7 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
+    """Each call consumes a contiguous chunk, slices one span per rank."""
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -470,9 +475,7 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-# -----------------------------
-# TRANSFORMER MODULES
-# -----------------------------
+# --- TRANSFORMER MODULES ---
 
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
@@ -484,14 +487,12 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
+    """Keep small/control parameters in fp32 even when the model body runs in bf16."""
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
@@ -499,7 +500,7 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    # Caches cos/sin tables per sequence length on the current device.
+    """Caches cos/sin tables per sequence length on the current device."""
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -549,10 +550,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        self.c_q = BitLinear(dim, dim, bias=False)
+        self.c_k = BitLinear(dim, kv_dim, bias=False)
+        self.c_v = BitLinear(dim, kv_dim, bias=False)
+        self.proj = BitLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -581,12 +582,12 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    """relu² MLP."""
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.fc = BitLinear(dim, hidden, bias=False)
+        self.proj = BitLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -770,7 +771,7 @@ class GPT(nn.Module):
         self.coda = Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
 
         self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        self.lm_head = None if tie_embeddings else BitLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
@@ -822,20 +823,16 @@ class GPT(nn.Module):
         return main_loss
 
 
-# -----------------------------
-# QAT HELPERS
-# -----------------------------
+# --- QAT HELPERS ---
 
 def activate_qat(model: nn.Module) -> None:
     """Enable ternary quantization in all BitLinear layers."""
     for m in model.modules():
-        if isinstance(m, BitLinear):
+        if hasattr(m, 'qat_enabled'):
             m.qat_enabled = True
 
 
-# -----------------------------
-# TEST-TIME TRAINING
-# -----------------------------
+# --- TEST-TIME TRAINING ---
 
 class TTTModule:
     """
@@ -960,9 +957,7 @@ class TTTModule:
         return float(suffix_loss.item()), suffix_token_count
 
 
-# -----------------------------
-# TRAINING
-# -----------------------------
+# --- TRAINING ---
 
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -971,9 +966,7 @@ def main() -> None:
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
-    # -----------------------------
-    # DISTRIBUTED + CUDA SETUP
-    # -----------------------------
+    # --- DISTRIBUTED + CUDA SETUP ---
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1029,35 +1022,39 @@ def main() -> None:
     )
     log0("=" * 100, console=False)
 
-    # -----------------------------
-    # TOKENIZER + VALIDATION METRIC SETUP
-    # -----------------------------
+    # --- TOKENIZER + VALIDATION METRIC SETUP ---
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+    if args.vocab_size == 256:
+        # Byte-level tokenization: each token is a single byte, no SentencePiece needed
+        sp = None
+        base_bytes_lut = torch.ones(256, dtype=torch.int16, device=device)
+        has_leading_space_lut = torch.zeros(256, dtype=torch.bool, device=device)
+        is_boundary_token_lut = torch.zeros(256, dtype=torch.bool, device=device)
+        log0("val_bpb:enabled tokenizer_kind=byte_level vocab_size=256")
+    else:
+        if not args.tokenizer_path.endswith(".model"):
+            raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
+        sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+        if int(sp.vocab_size()) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            )
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+            sp, args.vocab_size, device
         )
+        log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
-    )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
-    # -----------------------------
-    # MODEL + OPTIMIZER SETUP
-    # -----------------------------
+    # --- MODEL + OPTIMIZER SETUP ---
 
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -1077,7 +1074,7 @@ def main() -> None:
         progressive_loss_weight=args.progressive_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, BitLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
@@ -1188,9 +1185,7 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
 
-    # -----------------------------
-    # DATA LOADER & MODEL WARMUP
-    # -----------------------------
+    # --- DATA LOADER & MODEL WARMUP ---
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
@@ -1242,9 +1237,7 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # -----------------------------
-    # MAIN TRAINING LOOP
-    # -----------------------------
+    # --- MAIN TRAINING LOOP ---
 
     qat_switchover_step = int(args.qat_switchover_frac * args.iterations)
     qat_active = False
@@ -1356,11 +1349,7 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # -----------------------------
-    # SERIALIZATION + ROUNDTRIP VALIDATION
-    # -----------------------------
-    # Save the raw state, then produce the ternary-compressed + zlib artifact
-    # and validate the round-tripped weights produce identical outputs.
+    # --- SERIALIZATION + ROUNDTRIP VALIDATION ---
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1421,9 +1410,7 @@ def main() -> None:
     )
     log0(f"final_ternary_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
-    # -----------------------------
-    # TEST-TIME TRAINING EVALUATION
-    # -----------------------------
+    # --- TEST-TIME TRAINING EVALUATION ---
     if args.ttt_enabled and master_process:
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
@@ -1465,6 +1452,26 @@ def main() -> None:
             log0(f"ttt_eval: no documents adapted (skipped={ttt_docs_skipped})")
         torch.cuda.synchronize()
         log0(f"ttt_eval: completed in {1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
+
+    # --- Submission artifact generation ---
+    if master_process:
+        final_bpb = q_val_bpb  # post-compression round-trip BPB
+        submission = {
+            "author": os.environ.get("AUTHOR", "anonymous"),
+            "github_id": os.environ.get("GITHUB_ID", ""),
+            "name": os.environ.get("SUBMISSION_NAME", args.run_id),
+            "blurb": os.environ.get("SUBMISSION_BLURB", "Ternary QAT + depth recurrence + TTT"),
+            "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "val_loss": q_val_loss, "val_bpb": final_bpb,
+            "bytes_total": total_artifact_bytes, "bytes_code": code_bytes,
+        }
+        with open("submission.json", "w") as f:
+            json.dump(submission, f, indent=2)
+        log0(f"submission: val_bpb={final_bpb:.8f} bytes_total={total_artifact_bytes}")
+        if logfile is not None:
+            import shutil
+            shutil.copy2(logfile, "train.log")
+            log0(f"train.log copied from {logfile}")
 
     if distributed:
         dist.destroy_process_group()
