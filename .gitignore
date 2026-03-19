@@ -7,5 +7,7 @@ data/datasets
 data/manifest.json
 data/docs_selected.jsonl
 .mypy_cache/
+.hypothesis/
+.pytest_cache/
 .venv
 logs/
