@@ -1,0 +1,4 @@
+PLACEHOLDER — This file will be replaced with the actual training log from the 8xH100 RunPod run.
+
+Run command:
+RUN_ID=SubSixteen torchrun --standalone --nproc_per_node=8 train_gpt.py
