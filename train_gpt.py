@@ -645,11 +645,103 @@ class Block(nn.Module):
         return x
 
 
+class RecurrentBlockGroup(nn.Module):
+    """
+    Shared transformer blocks executed M times with per-loop differentiation.
+    Implements depth recurrence: K shared blocks × M loops = K×M effective depth.
+    """
+
+    def __init__(
+        self,
+        num_shared_blocks: int,
+        num_loops: int,
+        model_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+        loop_signal_rank: int,
+        progressive_loss_loops: list[int],
+    ):
+        super().__init__()
+        self.num_loops = num_loops
+        self.progressive_loss_loops = progressive_loss_loops
+
+        # K shared transformer blocks
+        self.blocks = nn.ModuleList([
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            for _ in range(num_shared_blocks)
+        ])
+
+        # Per-loop LayerNorm (unique per iteration)
+        self.loop_norms = nn.ModuleList([
+            nn.LayerNorm(model_dim) for _ in range(num_loops)
+        ])
+
+        # Per-loop low-rank signal: down_proj (dim -> rank) then up_proj (rank -> dim)
+        self.loop_signal_down = nn.Parameter(
+            torch.randn(num_loops, model_dim, loop_signal_rank) * 0.01
+        )
+        self.loop_signal_up = nn.Parameter(
+            torch.randn(num_loops, loop_signal_rank, model_dim) * 0.01
+        )
+
+        # Input injection blend weight (learnable per loop)
+        self.inject_alpha = nn.Parameter(torch.full((num_loops,), 0.1))
+
+    def forward(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        lm_head_fn: callable | None = None,
+        targets: Tensor | None = None,
+    ) -> tuple[Tensor, list[Tensor]]:
+        """
+        Args:
+            x: hidden states [B, T, D]
+            x0: original embedding [B, T, D]
+            lm_head_fn: optional callable(x, targets) -> loss for progressive loss
+            targets: target token ids for progressive loss
+        Returns:
+            x: final hidden states
+            aux_losses: list of progressive losses at intermediate loops
+        """
+        aux_losses: list[Tensor] = []
+        for loop_idx in range(self.num_loops):
+            # Per-loop LayerNorm
+            x = self.loop_norms[loop_idx](x)
+
+            # Low-rank loop signal injection
+            down = self.loop_signal_down[loop_idx].to(x.dtype)
+            up = self.loop_signal_up[loop_idx].to(x.dtype)
+            signal = torch.einsum("...d,dr->...r", x, down)
+            signal = torch.einsum("...r,rd->...d", signal, up)
+            x = x + signal
+
+            # Input injection: blend x0 back in
+            alpha = self.inject_alpha[loop_idx].to(x.dtype).sigmoid()
+            x = (1 - alpha) * x + alpha * x0
+
+            # Run shared blocks
+            for block in self.blocks:
+                x = block(x, x0)
+
+            # Progressive loss at designated loops
+            if (
+                loop_idx in self.progressive_loss_loops
+                and lm_head_fn is not None
+                and targets is not None
+            ):
+                aux_losses.append(lm_head_fn(x, targets))
+
+        return x, aux_losses
+
+
 class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        num_layers: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -659,6 +751,11 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_shared_blocks: int = 3,
+        num_loops: int = 10,
+        loop_signal_rank: int = 48,
+        progressive_loss_loops: list[int] | None = None,
+        progressive_loss_weight: float = 0.3,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,24 +763,30 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.progressive_loss_weight = progressive_loss_weight
+
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
+
+        # Prelude: 1 unique block
+        self.prelude = Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+
+        # Recurrent core: K shared blocks × M loops
+        self.recurrent = RecurrentBlockGroup(
+            num_shared_blocks=num_shared_blocks,
+            num_loops=num_loops,
+            model_dim=model_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            mlp_mult=mlp_mult,
+            rope_base=rope_base,
+            qk_gain_init=qk_gain_init,
+            loop_signal_rank=loop_signal_rank,
+            progressive_loss_loops=progressive_loss_loops or [4, 7],
         )
+
+        # Coda: 1 unique block
+        self.coda = Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -697,31 +800,44 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _compute_logits(self, x: Tensor, targets: Tensor) -> Tensor:
+        """Shared logit computation for main and progressive loss."""
+        h = self.final_norm(x).reshape(-1, x.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(h, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(h)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets.reshape(-1), reduction="mean")
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        # Prelude
+        x = self.prelude(x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        # Recurrent core with progressive loss
+        x, aux_losses = self.recurrent(
+            x, x0,
+            lm_head_fn=self._compute_logits,
+            targets=target_ids,
+        )
+
+        # Coda
+        x = self.coda(x, x0)
+
+        # Main loss
+        main_loss = self._compute_logits(x, target_ids)
+
+        # Combine with progressive losses
+        if aux_losses:
+            aux_mean = sum(aux_losses) / len(aux_losses)
+            return main_loss + self.progressive_loss_weight * aux_mean
+        return main_loss
 
 
 # -----------------------------
@@ -825,7 +941,6 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -848,7 +963,12 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    # Collect params from prelude, recurrent blocks, and coda
+    block_named_params = (
+        list(base_model.prelude.named_parameters())
+        + list(base_model.recurrent.blocks.named_parameters())
+        + list(base_model.coda.named_parameters())
+    )
     matrix_params = [
         p
         for name, p in block_named_params
@@ -859,8 +979,11 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    # Add recurrent loop signals, norms, and inject_alpha to scalar optimizer
+    for name, p in base_model.recurrent.named_parameters():
+        if name.startswith("blocks."):
+            continue  # already collected above
+        scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
