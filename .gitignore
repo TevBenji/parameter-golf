@@ -11,3 +11,8 @@ data/docs_selected.jsonl
 logs/
 
 .hypothesis/
+logs/*.pt
+*.ptz
+logs/
+.claude/settings.local.json
+STRATEGY.md
